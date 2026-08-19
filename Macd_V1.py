@@ -23,7 +23,9 @@
 #   3. 自动委托：TRADE_MODE = 'auto'，填写ACCOUNT后直接委托
 # =============================================================================
 
+import json
 import os
+from pathlib import Path
 import numpy as np
 import talib # type: ignore
 from datetime import datetime, timedelta
@@ -34,9 +36,8 @@ from datetime import datetime, timedelta
 # =============================================================================
 
 # ----- 账户与下单 -----
-ACCOUNT          = 'test'          # 请填写真实资金账号
-TRADE_MODE       = 'backtest'      # 'backtest' / 'notify' / 'auto'
-WECHAT_WORK_WEBHOOK_URL = ''       # notify模式的企业微信机器人Webhook；不要提交真实地址
+TRADE_MODE       = 'notify'        # 人工确认：仅发送企业微信通知，不委托；其他'backtest' / 'notify' / 'auto'
+LOCAL_CONFIG_PATH = Path(r'd:\projects\qmt\config\qmt.local.json')
 
 # ----- 标的池 -----
 STOCK_LIST = [
@@ -128,6 +129,30 @@ LOG_MOD_STAT      = True
 # =============================================================================
 # ========================【参数配置区结束】===================================
 # =============================================================================
+
+
+def _load_local_config():
+    """加载本机账户与企业微信配置；该文件必须保持在 Git 忽略列表中。"""
+    try:
+        with LOCAL_CONFIG_PATH.open('r', encoding='utf-8') as file:
+            config = json.load(file)
+    except FileNotFoundError as error:
+        raise RuntimeError(f"未找到本地配置文件: {LOCAL_CONFIG_PATH}") from error
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"本地配置文件不是有效 JSON: {LOCAL_CONFIG_PATH}") from error
+    except OSError as error:
+        raise RuntimeError(f"无法读取本地配置文件: {LOCAL_CONFIG_PATH}") from error
+
+    if not isinstance(config, dict):
+        raise ValueError("qmt.local.json 顶层必须是 JSON 对象")
+
+    account_id = str(config.get('account_id', '')).strip()
+    webhook_url = str(config.get('wecom_webhook_url', '')).strip()
+    if not account_id:
+        raise ValueError("qmt.local.json 缺少 account_id")
+    if not webhook_url:
+        raise ValueError("qmt.local.json 缺少 wecom_webhook_url")
+    return account_id, webhook_url
 
 
 # ---------------------------------------------------------------------------
@@ -421,17 +446,15 @@ def init(C):
     print("日线 MACD趋势 + KDJ/RSI自适应超卖策略 启动")
     print("=" * 60)
 
-    # 从【参数配置区】读取到 C
-    C.account                = ACCOUNT
+    # 从【参数配置区】及本地敏感配置读取到 C
+    C.account, C.wechat_work_webhook_url = _load_local_config()
+    C.set_account(C.account)
     C.trade_mode             = TRADE_MODE.lower()
     if C.trade_mode not in ('backtest', 'notify', 'auto'):
         raise ValueError(
             f"TRADE_MODE 必须是 'backtest'、'notify' 或 'auto'，当前为 {TRADE_MODE!r}"
         )
-    if C.trade_mode == 'auto' and (not C.account or C.account == 'test'):
-        raise ValueError("auto模式必须填写非 test 的真实资金账号 ACCOUNT")
     C.submit_orders          = C.trade_mode in ('backtest', 'auto')
-    C.wechat_work_webhook_url = WECHAT_WORK_WEBHOOK_URL
     C.stock_list             = STOCK_LIST
     C.buy_amount             = BUY_AMOUNT
     C.enable_repeat_buy      = ENABLE_REPEAT_BUY
@@ -522,6 +545,12 @@ def init(C):
     print(f"trade_mode={C.trade_mode}  submit_orders={C.submit_orders}  log_level={C.log_level}")
     if C.trade_mode == 'notify' and not C.wechat_work_webhook_url:
         _log_warn(C, "notify模式未配置WECHAT_WORK_WEBHOOK_URL，买卖信号只会输出到日志")
+    # if C.trade_mode == 'notify':
+    #     _send_wechat_notification(
+    #         C,
+    #         'QMT Notify 启动测试',
+    #         '策略已完成本地配置读取、账户绑定和企业微信连通性测试；未提交任何委托。',
+    #     )
     print("初始化完成，开始运行...")
     print("=" * 60)
 

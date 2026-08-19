@@ -1,0 +1,4 @@
+{
+  "account_id": "请填写你的QMT资金账号",
+  "wecom_webhook_url": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=请填写你的企业微信机器人key"
+}
