@@ -116,7 +116,7 @@ LOG_LEVEL         = 3              # 0=OFF 1=ERROR 2=WARN 3=INFO 4=DETAIL 5=DEBU
 LOG_TO_CONSOLE    = True
 LOG_TO_FILE       = False
 LOG_FILE_PATH     = r'D:\qmt_log\macd_kdj_rsi.log'
-LOG_BAR_EVERY_N   = 1
+LOG_BAR_EVERY_N   = 1              # DETAIL 日志已按交易日去重；必须保持 1
 
 LOG_MOD_BAR       = True
 LOG_MOD_POS       = True
@@ -160,6 +160,7 @@ def _load_local_config():
 # ---------------------------------------------------------------------------
 LOG_OFF, LOG_ERROR, LOG_WARN, LOG_INFO, LOG_DETAIL, LOG_DEBUG = 0, 1, 2, 3, 4, 5
 _LEVEL_NAME = {0: 'OFF', 1: 'ERROR', 2: 'WARN', 3: 'INFO', 4: 'DETAIL', 5: 'DEBUG'}
+_detail_bar_seen = set()
 
 
 def _get_weekly_log_path(base_path):
@@ -235,6 +236,18 @@ def _log_error(C, msg):
 
 def _log_warn(C, msg):
     _log(C, LOG_WARN, 'WARN', msg)
+
+
+def _should_log_detail_bar(stock, time_str):
+    """同一标的在同一交易日只输出一次 DETAIL 指标快照。"""
+    key = (stock, time_str)
+    if key in _detail_bar_seen:
+        return False
+    _detail_bar_seen.add(key)
+    if len(_detail_bar_seen) > 5000:
+        _detail_bar_seen.clear()
+        _detail_bar_seen.add(key)
+    return True
 
 
 def _inc(C, key, n=1):
@@ -442,6 +455,7 @@ def _get_market_data_safe(C, stock, fields, count=120, end_time=''):
 # ---------------------------------------------------------------------------
 
 def init(C):
+    _detail_bar_seen.clear()
     print("=" * 60)
     print("日线 MACD趋势 + KDJ/RSI自适应超卖策略 启动")
     print("=" * 60)
@@ -703,8 +717,8 @@ def _process_one(C, stock, time_str, idx, idx_prev):
         st['bars_held'] = st.get('bars_held', 0) + 1
         st['high_since_entry'] = max(float(st.get('high_since_entry') or 0), curr_close)
 
-    # DETAIL日志
-    if C.log_level >= LOG_DETAIL:
+    # DETAIL日志：实盘日线回调会重复触发，同一交易日只保留一次快照。
+    if C.log_level >= LOG_DETAIL and _should_log_detail_bar(stock, time_str):
         vol_info = f"量比={vol_ratio:.2f}" if vol_ratio is not None else "量比=N/A"
         vol_flag = "满足放量" if vol_ok else "不满足放量"
         atr_str = f"{curr_atr:.4f}" if curr_atr is not None else "N/A"
