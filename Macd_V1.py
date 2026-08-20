@@ -42,11 +42,11 @@ LOCAL_CONFIG_PATH = Path(r'd:\projects\qmt\config\qmt.local.json')
 # ----- 标的池 -----
 STOCK_LIST = [
     "603311.SH",  # 金海高科
-    # '512480.SH',   # 半导体ETF 国联安
-    # '159819.SZ',   # 人工智能ETF 易方达
-    # '562500.SH',   # 机器人ETF 华夏
-    # '159992.SZ',   # 创新药ETF 银华
-    # '512660.SH',   # 军工ETF 国泰
+    '512480.SH',   # 半导体ETF 国联安
+    '159819.SZ',   # 人工智能ETF 易方达
+    '562500.SH',   # 机器人ETF 华夏
+    '159992.SZ',   # 创新药ETF 银华
+    '512660.SH',   # 军工ETF 国泰
 ]
 
 # ----- 买入金额 -----
@@ -112,7 +112,7 @@ DIV_PEAK_ORDER    = 3
 
 # ----- 日志 -----
 LOG_ENABLE        = True
-LOG_LEVEL         = 5              # 0=OFF 1=ERROR 2=WARN 3=INFO 4=DETAIL 5=DEBUG
+LOG_LEVEL         = 3              # 0=OFF 1=ERROR 2=WARN 3=INFO 4=DETAIL 5=DEBUG
 LOG_TO_CONSOLE    = True
 LOG_TO_FILE       = False
 LOG_FILE_PATH     = r'D:\qmt_log\macd_kdj_rsi.log'
@@ -560,6 +560,10 @@ def init(C):
 # ---------------------------------------------------------------------------
 
 def handlebar(C):
+    # 非回测模式下，只处理最新K线（关键！）
+    if C.trade_mode != 'backtest' and not C.is_last_bar():
+        return
+    
     C._bar_callback_count = getattr(C, '_bar_callback_count', 0) + 1
     dt, time_str = _parse_bar_time(C)
     idx, idx_prev = _signal_index(C)
