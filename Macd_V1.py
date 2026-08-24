@@ -26,7 +26,7 @@
 import json
 import os
 from pathlib import Path
-import numpy as np
+import numpy as np # type: ignore
 import talib # type: ignore
 from datetime import datetime, timedelta
 
@@ -37,7 +37,7 @@ from datetime import datetime, timedelta
 
 # ----- 账户与下单 -----
 TRADE_MODE       = 'notify'        # 人工确认：仅发送企业微信通知，不委托；其他'backtest' / 'notify' / 'auto'
-LOCAL_CONFIG_PATH = Path(r'd:\projects\qmt\config\qmt.local.json')
+LOCAL_CONFIG_PATH = Path(r'c:\users\administrator\downloads\qmt.local.json')
 
 # ----- 标的池 -----
 STOCK_LIST = [
