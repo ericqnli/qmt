@@ -890,7 +890,7 @@ def _process_one(C, stock, time_str, idx, idx_prev, detail_messages):
                 trigger = rsi_ok
                 trigger_by = 'RSI(趋势)'
             else:
-                trigger = kdj_ok or rsi_ok
+                trigger = kdj_ok and rsi_ok
                 trigger_by = 'KDJ|RSI(中间)'
 
         if trigger and C.use_volume_filter and not vol_ok:
