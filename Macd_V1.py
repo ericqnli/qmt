@@ -117,6 +117,8 @@ LOG_TO_CONSOLE    = True
 LOG_TO_FILE       = False
 LOG_FILE_PATH     = r'D:\qmt_log\macd_kdj_rsi.log'
 LOG_BAR_EVERY_N   = 1              # DETAIL 日志已按交易日去重；必须保持 1
+GITHUB_LOG_REPOSITORY = 'ericqnli/qmt-signals'
+GITHUB_LOG_DIRECTORY  = 'daily'
 
 LOG_MOD_BAR       = True
 LOG_MOD_POS       = True
@@ -132,7 +134,7 @@ LOG_MOD_STAT      = True
 
 
 def _load_local_config():
-    """加载本机账户与企业微信配置；该文件必须保持在 Git 忽略列表中。"""
+    """加载本机账户、企业微信和 GitHub 配置；该文件必须保持在 Git 忽略列表中。"""
     try:
         with LOCAL_CONFIG_PATH.open('r', encoding='utf-8') as file:
             config = json.load(file)
@@ -148,11 +150,14 @@ def _load_local_config():
 
     account_id = str(config.get('account_id', '')).strip()
     webhook_url = str(config.get('wecom_webhook_url', '')).strip()
+    github_token = str(config.get('github_token', '')).strip()
     if not account_id:
         raise ValueError("qmt.local.json 缺少 account_id")
     if not webhook_url:
         raise ValueError("qmt.local.json 缺少 wecom_webhook_url")
-    return account_id, webhook_url
+    if not github_token:
+        raise ValueError("qmt.local.json 缺少 github_token")
+    return account_id, webhook_url, github_token
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +290,75 @@ def _send_wechat_notification(C, title, content):
     except Exception as e:
         _log_error(C, f"{title} 企业微信通知失败: {type(e).__name__}: {e}")
         _inc(C, 'wechat_notify_fail')
+        return False
+
+
+def _upload_log_to_github(C):
+    """将当前周日志覆盖上传到 GitHub，保留每个交易日收盘后的最新快照。"""
+    if not getattr(C, 'log_to_file', False):
+        _log_warn(C, "GitHub日志未上传：LOG_TO_FILE=False")
+        return False
+
+    log_path = _get_weekly_log_path(getattr(C, 'log_file_path', '') or '')
+    if not log_path or not os.path.isfile(log_path):
+        _log_warn(C, f"GitHub日志未上传：日志文件不存在 path={log_path}")
+        return False
+
+    repository = getattr(C, 'github_log_repository', '')
+    token = getattr(C, 'github_token', '')
+    if not repository or not token:
+        _log_warn(C, "GitHub日志未上传：仓库或令牌未配置")
+        return False
+
+    try:
+        import base64
+        from urllib.error import HTTPError
+        from urllib.parse import quote
+        from urllib.request import Request, urlopen
+
+        remote_path = '/'.join([
+            quote(getattr(C, 'github_log_directory', 'daily').strip('/'), safe=''),
+            quote(os.path.basename(log_path), safe=''),
+        ])
+        api_url = f'https://api.github.com/repos/{repository}/contents/{remote_path}'
+        headers = {
+            'Accept': 'application/vnd.github+json',
+            'Authorization': f'Bearer {token}',
+            'X-GitHub-Api-Version': '2022-11-28',
+        }
+
+        sha = None
+        try:
+            with urlopen(Request(api_url, headers=headers), timeout=15) as response:
+                existing = json.loads(response.read().decode('utf-8'))
+                sha = existing.get('sha')
+        except HTTPError as error:
+            if error.code != 404:
+                raise
+
+        with open(log_path, 'rb') as file:
+            encoded_content = base64.b64encode(file.read()).decode('ascii')
+        payload = {
+            'message': f'Update QMT log: {os.path.basename(log_path)}',
+            'content': encoded_content,
+        }
+        if sha:
+            payload['sha'] = sha
+        request = Request(
+            api_url,
+            data=json.dumps(payload).encode('utf-8'),
+            headers={**headers, 'Content-Type': 'application/json'},
+            method='PUT',
+        )
+        with urlopen(request, timeout=30) as response:
+            if response.status not in (200, 201):
+                raise RuntimeError(f'HTTP {response.status}')
+        _log(C, LOG_INFO, 'SYS', f"GitHub日志已上传: {repository}/{remote_path}")
+        _inc(C, 'github_log_upload_ok')
+        return True
+    except Exception as error:
+        _log_error(C, f"GitHub日志上传失败: {type(error).__name__}: {error}")
+        _inc(C, 'github_log_upload_fail')
         return False
 
 
@@ -461,7 +535,7 @@ def init(C):
     print("=" * 60)
 
     # 从【参数配置区】及本地敏感配置读取到 C
-    C.account, C.wechat_work_webhook_url = _load_local_config()
+    C.account, C.wechat_work_webhook_url, C.github_token = _load_local_config()
     C.set_account(C.account)
     C.trade_mode             = TRADE_MODE.lower()
     if C.trade_mode not in ('backtest', 'notify', 'auto'):
@@ -522,6 +596,8 @@ def init(C):
     C.log_to_file            = LOG_TO_FILE
     C.log_file_path          = LOG_FILE_PATH
     C.log_bar_every_n        = LOG_BAR_EVERY_N
+    C.github_log_repository  = GITHUB_LOG_REPOSITORY
+    C.github_log_directory   = GITHUB_LOG_DIRECTORY
 
     C.log_mod_bar            = LOG_MOD_BAR
     C.log_mod_pos            = LOG_MOD_POS
@@ -592,11 +668,13 @@ def handlebar(C):
             continue
 
     if C.trade_mode == 'notify' and detail_messages:
-        _send_wechat_notification(
+        notification_sent = _send_wechat_notification(
             C,
             f'日线状态 {time_str}',
             '\n'.join(detail_messages),
         )
+        if notification_sent:
+            _upload_log_to_github(C)
 
     if C._bar_callback_count % 50 == 0:
         _log(C, LOG_INFO, 'STAT', f"运行统计: {getattr(C, 'stats', {})}")

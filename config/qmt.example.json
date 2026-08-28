@@ -1,4 +1,5 @@
 {
   "account_id": "请填写你的QMT资金账号",
-  "wecom_webhook_url": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=请填写你的企业微信机器人key"
+  "wecom_webhook_url": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=请填写你的企业微信机器人key",
+  "github_token": "请填写仅对日志仓库授予Contents读写权限的fine-grained token"
 }
