@@ -613,6 +613,7 @@ def init(C):
     C.stats = {}
     C._bar_callback_count = 0
     C._log_file_error_reported = False
+    C.status_notify_seen = set()
 
     try:
         C.set_universe(C.stock_list)
@@ -657,30 +658,34 @@ def handlebar(C):
     C._bar_callback_count = getattr(C, '_bar_callback_count', 0) + 1
     dt, time_str = _parse_bar_time(C)
     idx, idx_prev = _signal_index(C)
-    detail_messages = []
+    status_messages = []
 
     for stock in C.stock_list:
         try:
-            _process_one(C, stock, time_str, idx, idx_prev, detail_messages)
+            _process_one(C, stock, time_str, idx, idx_prev, status_messages)
         except Exception as e:
             _log_error(C, f"{stock} 处理异常: {type(e).__name__}: {e}")
             _inc(C, 'error')
             continue
 
-    if C.trade_mode == 'notify' and detail_messages:
+    status_notify_seen = getattr(C, 'status_notify_seen', set())
+    if (C.trade_mode == 'notify' and status_messages
+            and time_str not in status_notify_seen):
         notification_sent = _send_wechat_notification(
             C,
             f'日线状态 {time_str}',
-            '\n'.join(detail_messages),
+            '\n'.join(status_messages),
         )
         if notification_sent:
+            status_notify_seen.add(time_str)
+            C.status_notify_seen = status_notify_seen
             _upload_log_to_github(C)
 
     if C._bar_callback_count % 50 == 0:
         _log(C, LOG_INFO, 'STAT', f"运行统计: {getattr(C, 'stats', {})}")
 
 
-def _process_one(C, stock, time_str, idx, idx_prev, detail_messages):
+def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
     # 1. 取数
     fields = ['close', 'high', 'low', 'volume', 'amount']
     
@@ -803,22 +808,23 @@ def _process_one(C, stock, time_str, idx, idx_prev, detail_messages):
         st['bars_held'] = st.get('bars_held', 0) + 1
         st['high_since_entry'] = max(float(st.get('high_since_entry') or 0), curr_close)
 
+    vol_info = f"量比={vol_ratio:.2f}" if vol_ratio is not None else "量比=N/A"
+    vol_flag = "满足放量" if vol_ok else "不满足放量"
+    atr_str = f"{curr_atr:.4f}" if curr_atr is not None else "N/A"
+    j_str = f"{curr_j:.1f}" if curr_j is not None else "N/A"
+    detail_payload = (
+        f"close={curr_close:.3f} "
+        f"DIF={curr_dif:.4f} DEA={curr_dea:.4f} MACD柱={curr_hist:.4f} "
+        f"RSI={curr_rsi:.1f} K={curr_k:.1f} D={curr_d:.1f} J={j_str} "
+        f"ADX={curr_adx:.1f}({regime}) ATR={atr_str} "
+        f"{vol_info}({vol_flag}) pos={st['vol']}"
+    )
+    status_messages.append(f"{stock} {detail_payload}")
+
     # DETAIL日志：实盘日线回调会重复触发，同一交易日只保留一次快照。
     if (C.log_level >= LOG_DETAIL and getattr(C, 'log_mod_bar', True)
             and _should_log_detail_bar(stock, time_str)):
-        vol_info = f"量比={vol_ratio:.2f}" if vol_ratio is not None else "量比=N/A"
-        vol_flag = "满足放量" if vol_ok else "不满足放量"
-        atr_str = f"{curr_atr:.4f}" if curr_atr is not None else "N/A"
-        j_str = f"{curr_j:.1f}" if curr_j is not None else "N/A"
-        detail_payload = (
-            f"close={curr_close:.3f} "
-            f"DIF={curr_dif:.4f} DEA={curr_dea:.4f} MACD柱={curr_hist:.4f} "
-            f"RSI={curr_rsi:.1f} K={curr_k:.1f} D={curr_d:.1f} J={j_str} "
-            f"ADX={curr_adx:.1f}({regime}) ATR={atr_str} "
-            f"{vol_info}({vol_flag}) pos={st['vol']}"
-        )
         _log(C, LOG_DETAIL, 'BAR', f"{stock} {time_str} {detail_payload}")
-        detail_messages.append(f"{stock} {detail_payload}")
 
     # ========== 有持仓 → 检查卖出 ==========
     if has_pos:
