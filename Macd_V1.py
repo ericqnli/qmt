@@ -114,7 +114,7 @@ DIV_PEAK_ORDER    = 3
 LOG_ENABLE        = True
 LOG_LEVEL         = 3              # 0=OFF 1=ERROR 2=WARN 3=INFO 4=DETAIL 5=DEBUG
 LOG_TO_CONSOLE    = True
-LOG_TO_FILE       = False
+LOG_TO_FILE       = True
 LOG_FILE_PATH     = r'C:\qmt_log\macd_kdj_rsi.log'
 LOG_BAR_EVERY_N   = 1              # DETAIL 日志已按交易日去重；必须保持 1
 GITHUB_LOG_REPOSITORY = 'ericqnli/qmt-signals'
@@ -166,7 +166,44 @@ def _load_local_config():
 LOG_OFF, LOG_ERROR, LOG_WARN, LOG_INFO, LOG_DETAIL, LOG_DEBUG = 0, 1, 2, 3, 4, 5
 _LEVEL_NAME = {0: 'OFF', 1: 'ERROR', 2: 'WARN', 3: 'INFO', 4: 'DETAIL', 5: 'DEBUG'}
 _detail_bar_seen = set()
+_status_notify_seen = set()
 
+
+def _daily_status_flag_path(time_str):
+    base = os.path.dirname(LOG_FILE_PATH or '') or '.'
+    return os.path.join(base, f'.wechat_status_{time_str}')
+
+
+def _already_sent_daily_status(time_str):
+    if not time_str or time_str == '----':
+        return True
+    if time_str in _status_notify_seen:
+        return True
+    path = _daily_status_flag_path(time_str)
+    if os.path.isfile(path):
+        _status_notify_seen.add(time_str)
+        return True
+    return False
+
+
+def _mark_daily_status_sent(time_str):
+    _status_notify_seen.add(time_str)
+    try:
+        path = _daily_status_flag_path(time_str)
+        folder = os.path.dirname(path)
+        if folder and not os.path.isdir(folder):
+            os.makedirs(folder, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(datetime.now().isoformat())
+    except Exception:
+        pass
+
+
+def _is_after_a_share_close(dt):
+    """A股日线收盘后再发汇总，避免盘中 last bar 反复触发。"""
+    if dt is None:
+        return False
+    return (dt.hour > 15) or (dt.hour == 15 and dt.minute >= 5)
 
 def _get_weekly_log_path(base_path):
     """按周滚动日志文件路径。"""
@@ -284,6 +321,11 @@ def _send_wechat_notification(C, title, content):
         with urlopen(request, timeout=10) as response:
             if response.status != 200:
                 raise RuntimeError(f'HTTP {response.status}')
+            result = json.loads(response.read().decode('utf-8'))
+        if not isinstance(result, dict) or result.get('errcode') != 0:
+            raise RuntimeError(
+                f"企业微信返回错误: {result.get('errmsg', result) if isinstance(result, dict) else result}"
+            )
         _log(C, LOG_INFO, 'SIGNAL', f"{title} 企业微信通知已发送")
         _inc(C, 'wechat_notify_ok')
         return True
@@ -366,9 +408,9 @@ def _upload_log_to_github(C):
 # 工具函数
 # ---------------------------------------------------------------------------
 
-def _parse_bar_time(C):
+def _parse_bar_time(C, offset=0):
     try:
-        bar_time = C.get_bar_timetag(C.barpos)
+        bar_time = C.get_bar_timetag(C.barpos + offset)
         if bar_time > 1e12:
             dt = datetime.fromtimestamp(bar_time / 1000.0)
         else:
@@ -613,7 +655,6 @@ def init(C):
     C.stats = {}
     C._bar_callback_count = 0
     C._log_file_error_reported = False
-    C.status_notify_seen = set()
 
     try:
         C.set_universe(C.stock_list)
@@ -656,8 +697,9 @@ def handlebar(C):
         return
     
     C._bar_callback_count = getattr(C, '_bar_callback_count', 0) + 1
-    dt, time_str = _parse_bar_time(C)
+    dt, _ = _parse_bar_time(C)
     idx, idx_prev = _signal_index(C)
+    _, time_str = _parse_bar_time(C, idx + 1)
     status_messages = []
 
     for stock in C.stock_list:
@@ -667,20 +709,22 @@ def handlebar(C):
             _log_error(C, f"{stock} 处理异常: {type(e).__name__}: {e}")
             _inc(C, 'error')
             continue
-
-    status_notify_seen = getattr(C, 'status_notify_seen', set())
-    if (C.trade_mode == 'notify' and status_messages
-            and time_str not in status_notify_seen):
+        
+    if (C.trade_mode == 'notify'
+            and status_messages
+            and _is_after_a_share_close(dt)
+            and not _already_sent_daily_status(time_str)):
         notification_sent = _send_wechat_notification(
             C,
             f'日线状态 {time_str}',
             '\n'.join(status_messages),
         )
         if notification_sent:
-            status_notify_seen.add(time_str)
-            C.status_notify_seen = status_notify_seen
+            _mark_daily_status_sent(time_str)
             _upload_log_to_github(C)
-
+        else:
+            _log_warn(C, f"{time_str} 日线状态未发送成功，本交易日将重试")    
+            
     if C._bar_callback_count % 50 == 0:
         _log(C, LOG_INFO, 'STAT', f"运行统计: {getattr(C, 'stats', {})}")
 
