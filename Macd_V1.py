@@ -115,7 +115,7 @@ LOG_ENABLE        = True
 LOG_LEVEL         = 3              # 0=OFF 1=ERROR 2=WARN 3=INFO 4=DETAIL 5=DEBUG
 LOG_TO_CONSOLE    = True
 LOG_TO_FILE       = False
-LOG_FILE_PATH     = r'D:\qmt_log\macd_kdj_rsi.log'
+LOG_FILE_PATH     = r'C:\qmt_log\macd_kdj_rsi.log'
 LOG_BAR_EVERY_N   = 1              # DETAIL 日志已按交易日去重；必须保持 1
 GITHUB_LOG_REPOSITORY = 'ericqnli/qmt-signals'
 GITHUB_LOG_DIRECTORY  = 'daily'
