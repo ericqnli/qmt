@@ -120,6 +120,13 @@ LOG_BAR_EVERY_N   = 1              # DETAIL 日志已按交易日去重；必须
 GITHUB_LOG_REPOSITORY = 'ericqnli/qmt-signals'
 GITHUB_LOG_DIRECTORY  = 'daily'
 
+# ----- 企业微信日线状态推送 -----
+# 仅在盘前（09:00-09:29）和盘后（15:05 起）各推送一次。
+PRE_MARKET_NOTIFY_START  = (9, 0)
+PRE_MARKET_NOTIFY_END    = (9, 30)
+POST_MARKET_NOTIFY_START = (15, 5)
+SEND_SIGNAL_NOTIFICATIONS = False  # 买卖信号仅写入盘前/盘后汇总，不单独即时推送
+
 LOG_MOD_BAR       = True
 LOG_MOD_POS       = True
 LOG_MOD_SIGNAL    = True
@@ -169,41 +176,45 @@ _detail_bar_seen = set()
 _status_notify_seen = set()
 
 
-def _daily_status_flag_path(time_str):
+def _daily_status_flag_path(time_str, period):
     base = os.path.dirname(LOG_FILE_PATH or '') or '.'
-    return os.path.join(base, f'.wechat_status_{time_str}')
+    return os.path.join(base, f'.wechat_status_{period}_{time_str}')
 
 
-def _already_sent_daily_status(time_str):
+def _already_sent_daily_status(time_str, period):
     if not time_str or time_str == '----':
         return True
-    if time_str in _status_notify_seen:
+    key = (period, time_str)
+    if key in _status_notify_seen:
         return True
-    path = _daily_status_flag_path(time_str)
+    path = _daily_status_flag_path(time_str, period)
     if os.path.isfile(path):
-        _status_notify_seen.add(time_str)
+        _status_notify_seen.add(key)
         return True
     return False
 
 
-def _mark_daily_status_sent(time_str):
-    _status_notify_seen.add(time_str)
+def _mark_daily_status_sent(time_str, period):
+    _status_notify_seen.add((period, time_str))
     try:
-        path = _daily_status_flag_path(time_str)
+        path = _daily_status_flag_path(time_str, period)
         folder = os.path.dirname(path)
         if folder and not os.path.isdir(folder):
             os.makedirs(folder, exist_ok=True)
         with open(path, 'w', encoding='utf-8') as f:
             f.write(datetime.now().isoformat())
-    except Exception:
-        pass
+    except Exception as error:
+        _log_warn(None, f"{period} {time_str} 日线状态标记写入失败: {error}")
 
 
-def _is_after_a_share_close(dt):
-    """A股日线收盘后再发汇总，避免盘中 last bar 反复触发。"""
-    if dt is None:
-        return False
-    return (dt.hour > 15) or (dt.hour == 15 and dt.minute >= 5)
+def _status_notification_period(now):
+    """返回当前允许推送日线状态的时段；其他时间不发送。"""
+    clock = (now.hour, now.minute)
+    if PRE_MARKET_NOTIFY_START <= clock < PRE_MARKET_NOTIFY_END:
+        return '盘前'
+    if clock >= POST_MARKET_NOTIFY_START:
+        return '盘后'
+    return None
 
 def _get_weekly_log_path(base_path):
     """按周滚动日志文件路径。"""
@@ -431,9 +442,10 @@ def _is_realtime_unclosed_bar(C):
     return False
 
 
-def _signal_index(C):
+def _signal_index(C, now=None):
     """返回用于决策的已收盘索引。实盘最新未收盘用 -2。"""
-    if _is_realtime_unclosed_bar(C):
+    now = now or datetime.now()
+    if _is_realtime_unclosed_bar(C) and (now.hour, now.minute) < POST_MARKET_NOTIFY_START:
         return -2, -3
     return -1, -2
 
@@ -697,8 +709,9 @@ def handlebar(C):
         return
     
     C._bar_callback_count = getattr(C, '_bar_callback_count', 0) + 1
-    dt, _ = _parse_bar_time(C)
-    idx, idx_prev = _signal_index(C)
+    now = datetime.now()
+    notify_period = _status_notification_period(now)
+    idx, idx_prev = _signal_index(C, now)
     _, time_str = _parse_bar_time(C, idx + 1)
     status_messages = []
 
@@ -712,18 +725,18 @@ def handlebar(C):
         
     if (C.trade_mode == 'notify'
             and status_messages
-            and _is_after_a_share_close(dt)
-            and not _already_sent_daily_status(time_str)):
+            and notify_period
+            and not _already_sent_daily_status(time_str, notify_period)):
         notification_sent = _send_wechat_notification(
             C,
-            f'日线状态 {time_str}',
+            f'{notify_period}日线状态 {time_str}',
             '\n'.join(status_messages),
         )
         if notification_sent:
-            _mark_daily_status_sent(time_str)
+            _mark_daily_status_sent(time_str, notify_period)
             _upload_log_to_github(C)
         else:
-            _log_warn(C, f"{time_str} 日线状态未发送成功，本交易日将重试")    
+            _log_warn(C, f"{notify_period} {time_str} 日线状态未发送成功，本时段将重试")
             
     if C._bar_callback_count % 50 == 0:
         _log(C, LOG_INFO, 'STAT', f"运行统计: {getattr(C, 'stats', {})}")
@@ -949,12 +962,17 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
                  f"数量={sell_vol} 成本={buy_price:.3f} 现价={curr_close:.3f} {pnl_str}")
 
             if C.trade_mode == 'notify':
-                _send_wechat_notification(
-                    C,
-                    f'卖出信号 {stock}',
-                    f'时间={time_str}\n原因={sell_reason}\n数量={sell_vol}\n'
-                    f'现价={curr_close:.3f}\n盈亏={pnl_str}\n请人工确认后下单。',
+                status_messages.append(
+                    f"{stock} 【卖出信号】原因={sell_reason} 数量={sell_vol} "
+                    f"现价={curr_close:.3f} {pnl_str} 请人工确认后下单。"
                 )
+                if SEND_SIGNAL_NOTIFICATIONS:
+                    _send_wechat_notification(
+                        C,
+                        f'卖出信号 {stock}',
+                        f'时间={time_str}\n原因={sell_reason}\n数量={sell_vol}\n'
+                        f'现价={curr_close:.3f}\n盈亏={pnl_str}\n请人工确认后下单。',
+                    )
                 _inc(C, 'signal_sell')
                 return
 
@@ -1055,13 +1073,19 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
                  f"次数={st.get('buy_count', 0) + 1}/{C.max_buy_count}")
 
             if C.trade_mode == 'notify':
-                _send_wechat_notification(
-                    C,
-                    f"{'加仓' if has_pos else '买入'}信号 {stock}",
-                    f'时间={time_str}\n触发={trigger_by}\n数量={vol}\n'
-                    f'现价={curr_close:.3f}\nMACD柱={prev_hist:.4f}→{curr_hist:.4f}\n'
-                    f'次数={st.get("buy_count", 0) + 1}/{C.max_buy_count}\n请人工确认后下单。',
+                status_messages.append(
+                    f"{stock} 【{'加仓' if has_pos else '买入'}信号】触发={trigger_by} "
+                    f"数量={vol} 现价={curr_close:.3f} "
+                    f"MACD柱={prev_hist:.4f}→{curr_hist:.4f} 请人工确认后下单。"
                 )
+                if SEND_SIGNAL_NOTIFICATIONS:
+                    _send_wechat_notification(
+                        C,
+                        f"{'加仓' if has_pos else '买入'}信号 {stock}",
+                        f'时间={time_str}\n触发={trigger_by}\n数量={vol}\n'
+                        f'现价={curr_close:.3f}\nMACD柱={prev_hist:.4f}→{curr_hist:.4f}\n'
+                        f'次数={st.get("buy_count", 0) + 1}/{C.max_buy_count}\n请人工确认后下单。',
+                    )
                 _inc(C, 'signal_buy')
                 return
 
