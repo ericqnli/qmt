@@ -42,11 +42,11 @@ LOCAL_CONFIG_PATH = Path(r'c:\users\administrator\downloads\qmt.local.json')
 # ----- 标的池 -----
 STOCK_LIST = [
     "603311.SH",  # 金海高科
-    '512480.SH',   # 半导体ETF 国联安
-    '159819.SZ',   # 人工智能ETF 易方达
-    '562500.SH',   # 机器人ETF 华夏
-    '159992.SZ',   # 创新药ETF 银华
-    '512660.SH',   # 军工ETF 国泰
+    # '512480.SH',   # 半导体ETF 国联安
+    # '159819.SZ',   # 人工智能ETF 易方达
+    # '562500.SH',   # 机器人ETF 华夏
+    # '159992.SZ',   # 创新药ETF 银华
+    # '512660.SH',   # 军工ETF 国泰
 ]
 
 # ----- 买入金额 -----
