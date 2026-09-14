@@ -829,6 +829,29 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
         elif curr_adx < C.adx_range:
             regime = 'range'
 
+    macd_green_shrinking = prev_hist < 0 and curr_hist < 0 and curr_hist > prev_hist
+    kdj_golden = (prev_k is not None and prev_d is not None
+                  and prev_k <= prev_d and curr_k > curr_d)
+    kdj_oversold = (curr_k < C.kdj_k_oversold
+                    or (curr_j is not None and curr_j < C.kdj_j_oversold))
+    kdj_ok = kdj_golden and kdj_oversold
+    rsi_ok = (curr_rsi <= C.rsi_oversold
+              and prev_rsi is not None and curr_rsi > prev_rsi)
+    mode = getattr(C, 'regime_mode', 'auto')
+    if mode == 'kdj':
+        entry_trigger, trigger_by = kdj_ok, 'KDJ'
+    elif mode == 'rsi':
+        entry_trigger, trigger_by = rsi_ok, 'RSI'
+    elif mode == 'both':
+        entry_trigger = kdj_ok or rsi_ok
+        trigger_by = 'KDJ' if kdj_ok else ('RSI' if rsi_ok else '')
+    elif regime == 'range':
+        entry_trigger, trigger_by = kdj_ok, 'KDJ(震荡)'
+    elif regime == 'trend':
+        entry_trigger, trigger_by = rsi_ok, 'RSI(趋势)'
+    else:
+        entry_trigger, trigger_by = kdj_ok and rsi_ok, 'KDJ|RSI(中间)'
+
     # 持仓状态
     st = _ensure_pos_state(C, stock)
     try:
@@ -861,6 +884,9 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
         st['bars_held'] = st.get('bars_held', 0) + 1
         st['high_since_entry'] = max(float(st.get('high_since_entry') or 0), curr_close)
 
+    can_buy = (not has_pos) or (
+        C.enable_repeat_buy and st.get('buy_count', 0) < C.max_buy_count
+    )
     vol_info = f"量比={vol_ratio:.2f}" if vol_ratio is not None else "量比=N/A"
     vol_flag = "满足放量" if vol_ok else "不满足放量"
     atr_str = f"{curr_atr:.4f}" if curr_atr is not None else "N/A"
@@ -870,7 +896,14 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
         f"DIF={curr_dif:.4f} DEA={curr_dea:.4f} MACD柱={curr_hist:.4f} "
         f"RSI={curr_rsi:.1f} K={curr_k:.1f} D={curr_d:.1f} J={j_str} "
         f"ADX={curr_adx:.1f}({regime}) ATR={atr_str} "
-        f"{vol_info}({vol_flag}) pos={st['vol']}"
+        f"{vol_info}({vol_flag}) pos={st['vol']}\n"
+        f"买入条件：MACD绿柱缩短={'是' if macd_green_shrinking else '否'} "
+        f"({prev_hist:.4f}→{curr_hist:.4f})；"
+        f"KDJ金叉={'是' if kdj_golden else '否'}、超卖={'是' if kdj_oversold else '否'}；"
+        f"RSI超卖回升={'是' if rsi_ok else '否'}；"
+        f"{'放量过滤=关闭' if not C.use_volume_filter else f'放量={vol_flag}'}；"
+        f"策略触发={trigger_by if entry_trigger else '否'}；"
+        f"可买入={'是' if can_buy else '否'}"
     )
     status_messages.append(f"{stock} {detail_payload}")
 
@@ -942,6 +975,18 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
                 sell_reason = f"时间止损(持仓{st['bars_held']}天)"
                 sell_ratio = 1.0
 
+        pnl_str = f"盈亏={pnl*100:+.2f}%" if pnl is not None else "盈亏=N/A"
+        status_messages.append(
+            f"{stock} 卖出条件：{pnl_str}；"
+            f"止损={sell_reason if sell_reason and '止损' in sell_reason else ('关闭' if not C.use_stop_loss else '未触发')}；"
+            f"止盈={sell_reason if sell_reason and '止盈' in sell_reason else ('关闭' if not C.use_take_profit else '未触发')}；"
+            f"移动止盈={sell_reason if sell_reason and '移动止盈' in sell_reason else ('关闭' if not C.use_trailing else '未触发')}；"
+            f"顶背离={'是' if sell_reason == 'MACD顶背离' else '否'}；"
+            f"死叉={'是' if sell_reason == 'MACD死叉' else '否'}；"
+            f"时间止损={sell_reason if sell_reason and '时间止损' in sell_reason else ('关闭' if not C.use_time_stop else '未触发')}；"
+            f"最终判断={sell_reason or '不卖出'}"
+        )
+
         if sell_reason and sell_ratio > 0:
             if _already_signaled(C, stock, time_str, f'SELL_{sell_reason}'):
                 return
@@ -952,7 +997,6 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
             if sell_vol <= 0:
                 return
 
-            pnl_str = f"盈亏={pnl*100:+.2f}%" if pnl is not None else "盈亏=N/A"
             _log(C, LOG_INFO, 'SIGNAL',
                  f"【{time_str} 卖出】{stock} {sell_reason} 比例={sell_ratio:.0%} "
                  f"数量={sell_vol} 成本={buy_price:.3f} 现价={curr_close:.3f} {pnl_str}")
@@ -995,45 +1039,13 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
                     st['half_sold'] = True
             _inc(C, 'signal_sell')
             return
+    else:
+        status_messages.append(f"{stock} 卖出条件：无持仓，不检查卖出信号。")
 
     # ========== 空仓或允许加仓 → 检查买入 ==========
-    can_buy = (not has_pos) or (
-        C.enable_repeat_buy and st.get('buy_count', 0) < C.max_buy_count
-    )
     if can_buy:
-        macd_green_shrinking = prev_hist < 0 and curr_hist < 0 and curr_hist > prev_hist
         macd_ok = macd_green_shrinking
-
-        kdj_golden = (prev_k is not None and prev_d is not None and
-                      prev_k <= prev_d and curr_k > curr_d)
-        kdj_oversold = (curr_k < C.kdj_k_oversold) or (curr_j is not None and curr_j < C.kdj_j_oversold)
-        kdj_ok = kdj_golden and kdj_oversold
-
-        rsi_ok = (curr_rsi <= C.rsi_oversold and prev_rsi is not None and curr_rsi > prev_rsi)
-
-        trigger = False
-        trigger_by = ''
-        mode = getattr(C, 'regime_mode', 'auto')
-
-        if mode == 'kdj':
-            trigger = kdj_ok
-            trigger_by = 'KDJ'
-        elif mode == 'rsi':
-            trigger = rsi_ok
-            trigger_by = 'RSI'
-        elif mode == 'both':
-            trigger = kdj_ok or rsi_ok
-            trigger_by = 'KDJ' if kdj_ok else ('RSI' if rsi_ok else '')
-        else:  # auto
-            if regime == 'range':
-                trigger = kdj_ok
-                trigger_by = 'KDJ(震荡)'
-            elif regime == 'trend':
-                trigger = rsi_ok
-                trigger_by = 'RSI(趋势)'
-            else:
-                trigger = kdj_ok and rsi_ok
-                trigger_by = 'KDJ|RSI(中间)'
+        trigger = entry_trigger
 
         if trigger and C.use_volume_filter and not vol_ok:
             vol_r_str = f"{vol_ratio:.2f}" if vol_ratio is not None else "N/A"
