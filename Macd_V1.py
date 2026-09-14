@@ -121,11 +121,9 @@ GITHUB_LOG_REPOSITORY = 'ericqnli/qmt-signals'
 GITHUB_LOG_DIRECTORY  = 'daily'
 
 # ----- 企业微信日线状态推送 -----
-# 仅在盘前（09:00-09:29）和盘后（15:05 起）各推送一次。
-PRE_MARKET_NOTIFY_START  = (9, 0)
-PRE_MARKET_NOTIFY_END    = (9, 30)
+# 仅在盘后（15:05 起）推送一次。
 POST_MARKET_NOTIFY_START = (15, 5)
-SEND_SIGNAL_NOTIFICATIONS = False  # 买卖信号仅写入盘前/盘后汇总，不单独即时推送
+SEND_SIGNAL_NOTIFICATIONS = False  # 买卖信号仅写入盘后汇总，不单独即时推送
 
 LOG_MOD_BAR       = True
 LOG_MOD_POS       = True
@@ -208,10 +206,8 @@ def _mark_daily_status_sent(time_str, period):
 
 
 def _status_notification_period(now):
-    """返回当前允许推送日线状态的时段；其他时间不发送。"""
+    """盘后才允许推送日线状态；其他时间不发送。"""
     clock = (now.hour, now.minute)
-    if PRE_MARKET_NOTIFY_START <= clock < PRE_MARKET_NOTIFY_END:
-        return '盘前'
     if clock >= POST_MARKET_NOTIFY_START:
         return '盘后'
     return None
