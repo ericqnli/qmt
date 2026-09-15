@@ -852,6 +852,19 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
     else:
         entry_trigger, trigger_by = kdj_ok and rsi_ok, 'KDJ|RSI(中间)'
 
+    if mode == 'auto':
+        regime_description = {
+            'range': '震荡市（ADX<20，使用KDJ金叉且超卖）',
+            'trend': '趋势市（ADX>25，使用RSI超卖回升）',
+            'mid': '中间状态（20≤ADX≤25，KDJ与RSI需同时满足）',
+        }[regime]
+    elif mode == 'kdj':
+        regime_description = '强制KDJ模式（ADX仅供参考）'
+    elif mode == 'rsi':
+        regime_description = '强制RSI模式（ADX仅供参考）'
+    else:
+        regime_description = 'KDJ或RSI模式（ADX仅供参考）'
+
     # 持仓状态
     st = _ensure_pos_state(C, stock)
     try:
@@ -897,6 +910,7 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
         f"RSI={curr_rsi:.1f} K={curr_k:.1f} D={curr_d:.1f} J={j_str} "
         f"ADX={curr_adx:.1f}({regime}) ATR={atr_str} "
         f"{vol_info}({vol_flag}) pos={st['vol']}\n"
+        f"ADX状态：{regime_description}；"
         f"买入条件：MACD绿柱缩短={'是' if macd_green_shrinking else '否'} "
         f"({prev_hist:.4f}→{curr_hist:.4f})；"
         f"KDJ金叉={'是' if kdj_golden else '否'}、超卖={'是' if kdj_oversold else '否'}；"
