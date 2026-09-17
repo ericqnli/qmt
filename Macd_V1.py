@@ -485,6 +485,40 @@ def _pnl_pct(buy_price, curr_price):
         return None
     return (curr_price - buy_price) / buy_price
 
+def _sma_tdx(series, n, m=1):
+    """通达信 SMA(X,N,M)=(M*X+(N-M)*Y')/N。首个有效值作为初值。"""
+    x = np.asarray(series, dtype=float)
+    y = np.full(x.shape, np.nan, dtype=float)
+    prev = None
+    n = float(n)
+    m = float(m)
+    for i, v in enumerate(x):
+        if np.isnan(v):
+            if prev is not None:
+                y[i] = prev
+            continue
+        if prev is None:
+            prev = v
+        else:
+            prev = (m * v + (n - m) * prev) / n
+        y[i] = prev
+    return y
+
+
+def _kdj_tdx(high, low, close, n=9, m1=3, m2=3):
+    """通达信 KDJ(N,M1,M2)。返回 K, D, J。"""
+    high = np.asarray(high, dtype=float)
+    low = np.asarray(low, dtype=float)
+    close = np.asarray(close, dtype=float)
+    llv = talib.MIN(low, timeperiod=n)
+    hhv = talib.MAX(high, timeperiod=n)
+    denom = hhv - llv
+    rsv = np.where(denom > 0, (close - llv) / denom * 100.0, 50.0)
+    rsv = np.where(np.isnan(llv) | np.isnan(hhv), np.nan, rsv)
+    k = _sma_tdx(rsv, m1, 1)
+    d = _sma_tdx(k, m2, 1)
+    j = 3.0 * k - 2.0 * d
+    return k, d, j
 
 def _detect_macd_top_divergence(close, dif, lookback=30, peak_order=3):
     """简单顶背离检测：价格创新高但DIF高点降低。"""
@@ -774,13 +808,8 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
     dif, dea, macd_hist = talib.MACD(close, C.macd_fast, C.macd_slow, C.macd_signal)
     rsi = talib.RSI(close, timeperiod=C.rsi_period)
 
-    slowk, slowd = talib.STOCH(high, low, close,
-                               fastk_period=C.kdj_n,
-                               slowk_period=C.kdj_m1,
-                               slowk_matype=0,
-                               slowd_period=C.kdj_m2,
-                               slowd_matype=0)
-    j = 3 * slowk - 2 * slowd
+    slowk, slowd, j = _kdj_tdx(high, low, close, C.kdj_n, C.kdj_m1, C.kdj_m2)
+    
 
     adx = talib.ADX(high, low, close, timeperiod=C.adx_period)
     atr = talib.ATR(high, low, close, timeperiod=C.atr_period)
