@@ -873,9 +873,9 @@ def init(C):
     if C.trade_mode in ('notify', 'auto'):
         if not hasattr(C, 'run_time') or not callable(C.run_time):
             raise RuntimeError("QMT Context 未提供 run_time，无法按日线收盘和定时委托运行")
-        C.run_time(_qmt_time(C.post_market_notify_start))
+        C.run_time(1, _qmt_time(C.post_market_notify_start))
         if C.trade_mode == 'auto':
-            C.run_time(_qmt_time(C.auto_execution_time))
+            C.run_time(1, _qmt_time(C.auto_execution_time))
 
     print(f"regime_mode={C.regime_mode}  stop_mode={C.stop_mode}  buy_amount={C.buy_amount}")
     print(f"use_stop_loss={C.use_stop_loss}  use_take_profit={C.use_take_profit}")
