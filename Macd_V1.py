@@ -15,7 +15,7 @@
 #       + 趋势市：RSI≤30 且拐头向上
 #       + both模式：以上任一满足
 #       + 可选成交量放量过滤（默认关）
-#   卖优先级：止损 > 止盈 > 移动止盈 > MACD顶背离(100%) > MACD死叉(可配置比例) > 时间止损
+#   卖优先级：止损 > 止盈 > 移动止盈 > MACD顶背离(100%) > MACD死叉(���配置比例) > 时间止损
 #
 # 【使用说明】
 #   1. 回测：TRADE_MODE = 'backtest'，向QMT回测引擎提交模拟委托
@@ -237,6 +237,14 @@ def _qmt_time(clock):
     return f'{hour:02d}{minute:02d}00'
 
 
+def _qmt_datetime(clock, date_str=None):
+    """生成 QMT 可接受的运行时间字符串：YYYY-MM-DD HH:MM:SS。"""
+    hour, minute = _validate_clock(clock, 'clock')
+    if date_str is None:
+        date_str = datetime.now().strftime('%Y-%m-%d')
+    return f'{date_str} {hour:02d}:{minute:02d}:00'
+
+
 def _load_pending_orders(C):
     path = C.pending_order_file_path
     if not os.path.isfile(path):
@@ -361,6 +369,7 @@ def _submit_due_pending_orders(C, now):
     if changed:
         C.pending_orders = remaining
         _save_pending_orders(C)
+
 
 def _get_weekly_log_path(base_path):
     """按周滚动日志文件路径。"""
@@ -693,7 +702,6 @@ def _detect_macd_top_divergence(close, dif, lookback=30, peak_order=3):
 
 def _get_market_data_safe(C, stock, fields, count=120, end_time=''):
     """安全获取行情：按回测当前日期截断，优先 get_market_data_ex。"""
-    # 1) 优先新接口，并传入 end_time，避免回测冻在最新一根
     try:
         kwargs = dict(
             period='1d',
@@ -720,7 +728,6 @@ def _get_market_data_safe(C, stock, fields, count=120, end_time=''):
     except Exception:
         pass
 
-    # 2) 兼容旧接口
     try:
         kwargs = dict(stock_code=[stock], period='1d', count=count)
         if end_time:
@@ -739,7 +746,6 @@ def _get_market_data_safe(C, stock, fields, count=120, end_time=''):
     except Exception:
         pass
 
-    # 3) 兜底：get_history_data（回测里通常会按当前bar截断）
     try:
         data = C.get_history_data(count, '1d', 'close')
         if stock in data and len(data[stock]) >= 50:
@@ -768,7 +774,6 @@ def init(C):
     print("日线 MACD趋势 + KDJ/RSI自适应超卖策略 启动")
     print("=" * 60)
 
-    # 从【参数配置区】及本地敏感配置读取到 C
     C.account, C.wechat_work_webhook_url, C.github_token = _load_local_config()
     C.set_account(C.account)
     C.trade_mode             = TRADE_MODE.lower()
@@ -849,7 +854,6 @@ def init(C):
     C.log_mod_skip           = LOG_MOD_SKIP
     C.log_mod_stat           = LOG_MOD_STAT
 
-    # 内部状态
     C.pos_state = {}
     C.signal_seen = set()
     C.stats = {}
@@ -862,7 +866,6 @@ def init(C):
     except Exception:
         print("set_universe 不支持，将使用列表循环取数")
 
-    # 下载历史数据（补充昨日以前的本地数据，消除 get_market_data 老接口警告）
     for code in C.stock_list:
         try:
             download_history_data(code, '1d', '20200101', '') # type: ignore
@@ -873,9 +876,9 @@ def init(C):
     if C.trade_mode in ('notify', 'auto'):
         if not hasattr(C, 'run_time') or not callable(C.run_time):
             raise RuntimeError("QMT Context 未提供 run_time，无法按日线收盘和定时委托运行")
-        C.run_time(1, _qmt_time(C.post_market_notify_start))
+        C.run_time('handlebar', '1nDay', _qmt_datetime(C.post_market_notify_start))
         if C.trade_mode == 'auto':
-            C.run_time(1, _qmt_time(C.auto_execution_time))
+            C.run_time('handlebar', '1nDay', _qmt_datetime(C.auto_execution_time))
 
     print(f"regime_mode={C.regime_mode}  stop_mode={C.stop_mode}  buy_amount={C.buy_amount}")
     print(f"use_stop_loss={C.use_stop_loss}  use_take_profit={C.use_take_profit}")
@@ -890,12 +893,6 @@ def init(C):
             f"次交易日{_qmt_time(C.auto_execution_time)}后提交待执行委托；"
             f"待执行数={len(C.pending_orders)}"
         )
-    # if C.trade_mode == 'notify':
-    #     _send_wechat_notification(
-    #         C,
-    #         'QMT Notify 启动测试',
-    #         '策略已完成本地配置读取、账户绑定和企业微信连通性测试；未提交任何委托。',
-    #     )
     print("初始化完成，开始运行...")
     print("=" * 60)
 
@@ -905,7 +902,6 @@ def init(C):
 # ---------------------------------------------------------------------------
 
 def handlebar(C):
-    # 非回测模式下，只处理最新K线（关键！）
     if C.trade_mode != 'backtest' and not C.is_last_bar():
         return
     
@@ -916,7 +912,6 @@ def handlebar(C):
     if C.trade_mode == 'auto':
         _submit_due_pending_orders(C, now)
 
-    # 实盘信号只能用完整日线计算；盘后定时回调前不生成或提交新的信号。
     if C.trade_mode in ('notify', 'auto') and not notify_period:
         return
 
@@ -952,15 +947,11 @@ def handlebar(C):
 
 
 def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
-    # 1. 取数
     fields = ['close', 'high', 'low', 'volume', 'amount']
-    
-    # data = _get_market_data_safe(C, stock, fields, count=120)
-    # 用当前回测日期作为 end_time，保证数据随日期滚动
     end_time = ''
     if time_str and time_str != '----':
-        end_time = time_str.replace('-', '')  # '2026-02-02' -> '20260202'
-    data = _get_market_data_safe(C, stock, fields, count=120, end_time=end_time)    
+        end_time = time_str.replace('-', '')
+    data = _get_market_data_safe(C, stock, fields, count=120, end_time=end_time)
     if data is None or data.get('close') is None or len(data['close']) < 60:
         _log(C, LOG_DEBUG, 'SKIP', f"{stock} 数据不足，跳过")
         _inc(C, 'skip_data')
@@ -983,13 +974,9 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
     if idx < -n or idx_prev < -n:
         return
 
-    # 2. 计算指标
     dif, dea, macd_hist = talib.MACD(close, C.macd_fast, C.macd_slow, C.macd_signal)
     rsi = talib.RSI(close, timeperiod=C.rsi_period)
-
     slowk, slowd, j = _kdj_tdx(high, low, close, C.kdj_n, C.kdj_m1, C.kdj_m2)
-    
-
     adx = talib.ADX(high, low, close, timeperiod=C.adx_period)
     atr = talib.ATR(high, low, close, timeperiod=C.atr_period)
 
@@ -1014,7 +1001,6 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
         _log(C, LOG_DEBUG, 'SKIP', f"{stock} 指标含NaN，跳过")
         return
 
-    # 成交量
     vol_ratio = None
     vol_ok = True
     if amt is not None and len(amt) >= C.volume_ma_period + 5:
@@ -1029,7 +1015,6 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
     else:
         vol_ok = True
 
-    # 市场状态
     regime = 'mid'
     if curr_adx is not None:
         if curr_adx > C.adx_trend:
@@ -1073,7 +1058,6 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
     else:
         regime_description = 'KDJ或RSI模式（ADX仅供参考）'
 
-    # 持仓状态
     st = _ensure_pos_state(C, stock)
     try:
         broker_pos = C.get_position(stock) if hasattr(C, 'get_position') else 0
@@ -1129,12 +1113,10 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
     )
     status_messages.append(f"{stock} {detail_payload}")
 
-    # DETAIL日志：实盘日线回调会重复触发，同一交易日只保留一次快照。
     if (C.log_level >= LOG_DETAIL and getattr(C, 'log_mod_bar', True)
             and _should_log_detail_bar(stock, time_str)):
         _log(C, LOG_DETAIL, 'BAR', f"{stock} {time_str} {detail_payload}")
 
-    # ========== 有持仓 → 检查卖出 ==========
     if has_pos:
         sell_reason = None
         sell_ratio = 0.0
@@ -1143,7 +1125,6 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
         pnl = _pnl_pct(buy_price, curr_close)
         high_since = float(st.get('high_since_entry') or curr_close)
 
-        # 1. 止损
         if C.use_stop_loss:
             if C.stop_mode == 'pct':
                 if pnl is not None and pnl <= -C.stop_loss_pct:
@@ -1155,7 +1136,6 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
                     sell_reason = "ATR止损"
                     sell_ratio = 1.0
 
-        # 2. 止盈
         if sell_reason is None and C.use_take_profit:
             if C.stop_mode == 'pct':
                 if pnl is not None and pnl >= C.take_profit_pct:
@@ -1167,14 +1147,12 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
                     sell_reason = "ATR止盈"
                     sell_ratio = 1.0
 
-        # 3. 移动止盈
         if sell_reason is None and C.use_trailing and high_since > 0:
             drawdown = (high_since - curr_close) / high_since
             if drawdown >= C.trail_pct:
                 sell_reason = f"移动止盈(从高点回撤{drawdown*100:.2f}%)"
                 sell_ratio = 1.0
 
-        # 4. MACD 顶背离
         if sell_reason is None:
             div_end = None if idx == -1 else n + idx + 1
             if _detect_macd_top_divergence(close[:div_end],
@@ -1184,7 +1162,6 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
                 sell_reason = "MACD顶背离"
                 sell_ratio = 1.0
 
-        # 5. MACD 死叉
         if sell_reason is None and not st.get('half_sold', False):
             death = (prev_dif is not None and prev_dea is not None and
                      prev_dif > prev_dea and curr_dif < curr_dea)
@@ -1192,7 +1169,6 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
                 sell_reason = "MACD死叉"
                 sell_ratio = float(C.death_cross_sell_ratio)
 
-        # 6. 时间止损
         if sell_reason is None and C.use_time_stop:
             if st.get('bars_held', 0) >= C.max_hold_days:
                 sell_reason = f"时间止损(持仓{st['bars_held']}天)"
@@ -1290,7 +1266,6 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
     else:
         status_messages.append(f"{stock} 卖出条件：无持仓，不检查卖出信号。")
 
-    # ========== 空仓或允许加仓 → 检查买入 ==========
     if can_buy:
         macd_ok = macd_green_shrinking
         trigger = entry_trigger
