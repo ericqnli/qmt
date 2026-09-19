@@ -20,7 +20,7 @@
 # 【使用说明】
 #   1. 回测：TRADE_MODE = 'backtest'，向QMT回测引擎提交模拟委托
 #   2. 人工确认：TRADE_MODE = 'notify'，发送企业微信通知但不委托
-#   3. 自动委托：TRADE_MODE = 'auto'，填写ACCOUNT后直接委托
+#   3. 自动委托：TRADE_MODE = 'auto'，盘后生成信号，次交易日定时委托
 # =============================================================================
 
 import json
@@ -36,7 +36,7 @@ from datetime import datetime, timedelta
 # =============================================================================
 
 # ----- 账户与下单 -----
-TRADE_MODE       = 'notify'        # 人工确认：仅发送企业微信通知，不委托；其他'backtest' / 'notify' / 'auto'
+TRADE_MODE       = 'auto'          # 'backtest' / 'notify' / 'auto'
 LOCAL_CONFIG_PATH = Path(r'c:\users\administrator\downloads\qmt.local.json')
 
 # ----- 标的池 -----
@@ -50,9 +50,9 @@ STOCK_LIST = [
 ]
 
 # ----- 买入金额 -----
-BUY_AMOUNT       = 50000           # 单标的单次买入金额（元）
+BUY_AMOUNT       = 10000           # 单标的单次买入金额（元）
 ENABLE_REPEAT_BUY = True           # True=允许持仓期间重复买入
-MAX_BUY_COUNT     = 3              # 单个完整持仓周期最多买入次数
+MAX_BUY_COUNT     = 2              # 单个完整持仓周期最多买入次数
 
 # ----- MACD -----
 MACD_FAST        = 12
@@ -124,6 +124,11 @@ GITHUB_LOG_DIRECTORY  = 'daily'
 # 仅在盘后（15:05 起）推送一次。
 POST_MARKET_NOTIFY_START = (15, 5)
 SEND_SIGNAL_NOTIFICATIONS = False  # 买卖信号仅写入盘后汇总，不单独即时推送
+
+# ----- 自动委托时点 -----
+# auto 模式：盘后按完整日线记录信号；下一交易日到达该时间后按最新价提交。
+AUTO_EXECUTION_TIME = (9, 35)
+PENDING_ORDER_FILE_PATH = r'C:\qmt_log\macd_pending_orders.json'
 
 LOG_MOD_BAR       = True
 LOG_MOD_POS       = True
@@ -211,6 +216,151 @@ def _status_notification_period(now):
     if clock >= POST_MARKET_NOTIFY_START:
         return '盘后'
     return None
+
+
+def _clock_reached(now, target):
+    return (now.hour, now.minute) >= target
+
+
+def _validate_clock(value, name):
+    if not isinstance(value, tuple) or len(value) != 2:
+        raise ValueError(f"{name} 必须是 (时, 分)，当前为 {value!r}")
+    hour, minute = value
+    if (not isinstance(hour, int) or not isinstance(minute, int)
+            or not 0 <= hour <= 23 or not 0 <= minute <= 59):
+        raise ValueError(f"{name} 必须是有效的 (时, 分)，当前为 {value!r}")
+    return hour, minute
+
+
+def _qmt_time(clock):
+    hour, minute = clock
+    return f'{hour:02d}{minute:02d}00'
+
+
+def _load_pending_orders(C):
+    path = C.pending_order_file_path
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, 'r', encoding='utf-8') as file:
+            orders = json.load(file)
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"无法读取待执行委托文件: {path}") from error
+    if not isinstance(orders, list) or not all(isinstance(order, dict) for order in orders):
+        raise ValueError(f"待执行委托文件格式错误: {path}")
+    return orders
+
+
+def _save_pending_orders(C):
+    path = C.pending_order_file_path
+    folder = os.path.dirname(path)
+    if folder and not os.path.isdir(folder):
+        os.makedirs(folder, exist_ok=True)
+    temp_path = f'{path}.tmp'
+    try:
+        with open(temp_path, 'w', encoding='utf-8') as file:
+            json.dump(C.pending_orders, file, ensure_ascii=False, indent=2)
+        os.replace(temp_path, path)
+    except OSError as error:
+        raise RuntimeError(f"无法保存待执行委托文件: {path}") from error
+
+
+def _queue_pending_order(C, order):
+    key = (order['signal_date'], order['stock'], order['side'])
+    for pending in C.pending_orders:
+        if (pending.get('signal_date'), pending.get('stock'), pending.get('side')) == key:
+            _log(C, LOG_DEBUG, 'SIGNAL',
+                 f"{order['stock']} {order['signal_date']} {order['side']} 已在待执行队列")
+            return False
+    C.pending_orders.append(order)
+    try:
+        _save_pending_orders(C)
+    except Exception:
+        C.pending_orders.pop()
+        raise
+    return True
+
+
+def _submit_due_pending_orders(C, now):
+    if (C.trade_mode != 'auto'
+            or not _clock_reached(now, C.auto_execution_time)
+            or _clock_reached(now, C.post_market_notify_start)):
+        return
+
+    today = now.strftime('%Y-%m-%d')
+    remaining = []
+    changed = False
+    for order in C.pending_orders:
+        signal_date = str(order.get('signal_date', ''))
+        if not signal_date or signal_date >= today:
+            remaining.append(order)
+            continue
+
+        stock = str(order.get('stock', ''))
+        side = str(order.get('side', ''))
+        try:
+            volume = int(order.get('volume', 0))
+        except (TypeError, ValueError):
+            volume = 0
+        if not stock or side not in ('BUY', 'SELL') or volume < 100:
+            _log_error(C, f"待执行委托格式错误，已丢弃: {order!r}")
+            changed = True
+            continue
+
+        if side == 'SELL':
+            try:
+                broker_pos = int(C.get_position(stock)) if hasattr(C, 'get_position') else 0
+            except Exception as error:
+                _log_error(C, f"{stock} 查询卖出持仓失败，已取消待执行委托: {error}")
+                changed = True
+                continue
+            volume = min(volume, (broker_pos // 100) * 100)
+            if volume < 100:
+                _log_warn(C, f"{stock} 可卖持仓不足，已取消待执行卖出委托")
+                changed = True
+                continue
+
+        try:
+            passorder(23 if side == 'BUY' else 24, 1101, C.account, stock, 14, -1, volume, # type: ignore
+                      'MACD_KDJ_RSI', 1, '', C)
+        except Exception as error:
+            _log_error(C, f"{stock} 待执行{side}委托失败，已取消待执行委托: {error}")
+            changed = True
+            continue
+
+        changed = True
+        st = _ensure_pos_state(C, stock)
+        if side == 'BUY':
+            reference_price = float(order.get('reference_price', 0.0))
+            old_vol = st['vol']
+            st['vol'] = old_vol + volume
+            if old_vol > 0:
+                st['buy_price'] = (
+                    st['buy_price'] * old_vol + reference_price * volume
+                ) / st['vol']
+            else:
+                st['buy_price'] = reference_price
+                st['buy_time'] = today
+                st['bars_held'] = 0
+                st['high_since_entry'] = reference_price
+                st['half_sold'] = False
+                st['entry_atr'] = float(order.get('entry_atr', 0.0))
+            st['buy_count'] = st.get('buy_count', 0) + 1
+        else:
+            st['vol'] = max(0, st['vol'] - volume)
+            if st['vol'] == 0:
+                st['buy_price'] = 0.0
+                st['half_sold'] = False
+                st['bars_held'] = 0
+                st['high_since_entry'] = 0.0
+                st['buy_count'] = 0
+        _log(C, LOG_INFO, 'ORDER',
+             f"{stock} 待执行{side}委托已提交 vol={volume} 信号日={signal_date}")
+        _inc(C, f'order_{side.lower()}')
+
+    if changed:
+        C.pending_orders = remaining
+        _save_pending_orders(C)
 
 def _get_weekly_log_path(base_path):
     """按周滚动日志文件路径。"""
@@ -626,7 +776,15 @@ def init(C):
         raise ValueError(
             f"TRADE_MODE 必须是 'backtest'、'notify' 或 'auto'，当前为 {TRADE_MODE!r}"
         )
-    C.submit_orders          = C.trade_mode in ('backtest', 'auto')
+    C.post_market_notify_start = _validate_clock(
+        POST_MARKET_NOTIFY_START, 'POST_MARKET_NOTIFY_START'
+    )
+    C.auto_execution_time = _validate_clock(AUTO_EXECUTION_TIME, 'AUTO_EXECUTION_TIME')
+    if C.auto_execution_time == C.post_market_notify_start:
+        raise ValueError("AUTO_EXECUTION_TIME 不能与 POST_MARKET_NOTIFY_START 相同")
+    C.pending_order_file_path = PENDING_ORDER_FILE_PATH
+    C.pending_orders = _load_pending_orders(C)
+    C.submit_orders          = C.trade_mode == 'backtest'
     C.stock_list             = STOCK_LIST
     C.buy_amount             = BUY_AMOUNT
     C.enable_repeat_buy      = ENABLE_REPEAT_BUY
@@ -712,13 +870,26 @@ def init(C):
         except Exception as e:
             print(f"下载历史数据失败 {code}: {e}")
 
+    if C.trade_mode in ('notify', 'auto'):
+        if not hasattr(C, 'run_time') or not callable(C.run_time):
+            raise RuntimeError("QMT Context 未提供 run_time，无法按日线收盘和定时委托运行")
+        C.run_time(_qmt_time(C.post_market_notify_start))
+        if C.trade_mode == 'auto':
+            C.run_time(_qmt_time(C.auto_execution_time))
+
     print(f"regime_mode={C.regime_mode}  stop_mode={C.stop_mode}  buy_amount={C.buy_amount}")
     print(f"use_stop_loss={C.use_stop_loss}  use_take_profit={C.use_take_profit}")
     print(f"enable_repeat_buy={C.enable_repeat_buy}  max_buy_count={C.max_buy_count}")
     print(f"use_volume_filter={C.use_volume_filter}  death_cross_ratio={C.death_cross_sell_ratio}")
     print(f"trade_mode={C.trade_mode}  submit_orders={C.submit_orders}  log_level={C.log_level}")
-    if C.trade_mode == 'notify' and not C.wechat_work_webhook_url:
-        _log_warn(C, "notify模式未配置WECHAT_WORK_WEBHOOK_URL，买卖信号只会输出到日志")
+    if C.trade_mode in ('notify', 'auto') and not C.wechat_work_webhook_url:
+        _log_warn(C, "未配置WECHAT_WORK_WEBHOOK_URL，日线状态只会输出到日志")
+    if C.trade_mode == 'auto':
+        print(
+            f"auto模式：盘后{_qmt_time(C.post_market_notify_start)}记录信号并推送，"
+            f"次交易日{_qmt_time(C.auto_execution_time)}后提交待执行委托；"
+            f"待执行数={len(C.pending_orders)}"
+        )
     # if C.trade_mode == 'notify':
     #     _send_wechat_notification(
     #         C,
@@ -741,6 +912,14 @@ def handlebar(C):
     C._bar_callback_count = getattr(C, '_bar_callback_count', 0) + 1
     now = datetime.now()
     notify_period = _status_notification_period(now)
+
+    if C.trade_mode == 'auto':
+        _submit_due_pending_orders(C, now)
+
+    # 实盘信号只能用完整日线计算；盘后定时回调前不生成或提交新的信号。
+    if C.trade_mode in ('notify', 'auto') and not notify_period:
+        return
+
     idx, idx_prev = _signal_index(C, now)
     _, time_str = _parse_bar_time(C, idx + 1)
     status_messages = []
@@ -753,7 +932,7 @@ def handlebar(C):
             _inc(C, 'error')
             continue
         
-    if (C.trade_mode == 'notify'
+    if (C.trade_mode in ('notify', 'auto')
             and status_messages
             and notify_period
             and not _already_sent_daily_status(time_str, notify_period)):
@@ -1060,6 +1239,31 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
                 _inc(C, 'signal_sell')
                 return
 
+            if C.trade_mode == 'auto':
+                order = {
+                    'signal_date': time_str,
+                    'stock': stock,
+                    'side': 'SELL',
+                    'volume': sell_vol,
+                    'reason': sell_reason,
+                    'reference_price': curr_close,
+                }
+                try:
+                    queued = _queue_pending_order(C, order)
+                except Exception as error:
+                    _log_error(C, f"{stock} 卖出信号未写入待执行队列: {error}")
+                    return
+                status_messages.append(
+                    f"{stock} 【卖出信号】原因={sell_reason} 数量={sell_vol} "
+                    f"收盘价={curr_close:.3f} {pnl_str}；"
+                    f"将在下一交易日 {_qmt_time(C.auto_execution_time)} 后自动委托。"
+                )
+                if queued:
+                    _log(C, LOG_INFO, 'SIGNAL',
+                         f"{stock} 卖出信号已加入待执行队列 vol={sell_vol}")
+                    _inc(C, 'signal_sell')
+                return
+
             if C.submit_orders:
                 try:
                     passorder(24, 1101, C.account, stock, 14, -1, sell_vol, # type: ignore
@@ -1139,6 +1343,32 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
                         f'次数={st.get("buy_count", 0) + 1}/{C.max_buy_count}\n请人工确认后下单。',
                     )
                 _inc(C, 'signal_buy')
+                return
+
+            if C.trade_mode == 'auto':
+                order = {
+                    'signal_date': time_str,
+                    'stock': stock,
+                    'side': 'BUY',
+                    'volume': vol,
+                    'reason': trigger_by,
+                    'reference_price': curr_close,
+                    'entry_atr': curr_atr if curr_atr else 0.0,
+                }
+                try:
+                    queued = _queue_pending_order(C, order)
+                except Exception as error:
+                    _log_error(C, f"{stock} 买入信号未写入待执行队列: {error}")
+                    return
+                status_messages.append(
+                    f"{stock} 【{'加仓' if has_pos else '买入'}信号】触发={trigger_by} "
+                    f"数量={vol} 收盘价={curr_close:.3f}；"
+                    f"将在下一交易日 {_qmt_time(C.auto_execution_time)} 后自动委托。"
+                )
+                if queued:
+                    _log(C, LOG_INFO, 'SIGNAL',
+                         f"{stock} 买入信号已加入待执行队列 vol={vol}")
+                    _inc(C, 'signal_buy')
                 return
 
             if C.submit_orders:
