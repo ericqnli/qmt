@@ -317,7 +317,7 @@ def _submit_due_pending_orders(C, now):
 
         if side == 'SELL':
             try:
-                broker_pos = int(C.get_position(stock)) if hasattr(C, 'get_position') else 0
+                broker_pos = _get_broker_position_volume(C, stock)
             except Exception as error:
                 _log_error(C, f"{stock} 查询卖出持仓失败，已取消待执行委托: {error}")
                 changed = True
@@ -337,33 +337,9 @@ def _submit_due_pending_orders(C, now):
             continue
 
         changed = True
-        st = _ensure_pos_state(C, stock)
-        if side == 'BUY':
-            reference_price = float(order.get('reference_price', 0.0))
-            old_vol = st['vol']
-            st['vol'] = old_vol + volume
-            if old_vol > 0:
-                st['buy_price'] = (
-                    st['buy_price'] * old_vol + reference_price * volume
-                ) / st['vol']
-            else:
-                st['buy_price'] = reference_price
-                st['buy_time'] = today
-                st['bars_held'] = 0
-                st['high_since_entry'] = reference_price
-                st['half_sold'] = False
-                st['entry_atr'] = float(order.get('entry_atr', 0.0))
-            st['buy_count'] = st.get('buy_count', 0) + 1
-        else:
-            st['vol'] = max(0, st['vol'] - volume)
-            if st['vol'] == 0:
-                st['buy_price'] = 0.0
-                st['half_sold'] = False
-                st['bars_held'] = 0
-                st['high_since_entry'] = 0.0
-                st['buy_count'] = 0
         _log(C, LOG_INFO, 'ORDER',
-             f"{stock} 待执行{side}委托已提交 vol={volume} 信号日={signal_date}")
+             f"{stock} 待执行{side}委托已提交 vol={volume} 信号日={signal_date}；"
+             "等待券商成交回报后同步持仓")
         _inc(C, f'order_{side.lower()}')
 
     if changed:
@@ -612,6 +588,41 @@ def _calc_volume_by_amount(amount, price):
     return int(amount / price / 100) * 100
 
 
+def _position_volume(position):
+    """兼容 QMT 返回的数值、对象和字典持仓结构。"""
+    if position is None:
+        return 0
+    if isinstance(position, (int, float, np.integer, np.floating)):
+        return max(0, int(position))
+    names = ('can_use_volume', 'volume', 'available_volume', 'total_volume')
+    if isinstance(position, dict):
+        for name in names:
+            if name in position and position[name] is not None:
+                return max(0, int(float(position[name])))
+    else:
+        for name in names:
+            value = getattr(position, name, None)
+            if value is not None:
+                return max(0, int(float(value)))
+    raise ValueError(f"无法识别的持仓数据: {position!r}")
+
+
+def _get_broker_position_volume(C, stock):
+    if not hasattr(C, 'get_position'):
+        return 0
+    return _position_volume(C.get_position(stock))
+
+
+def _reset_position_state(st):
+    st['vol'] = 0
+    st['buy_price'] = 0.0
+    st['buy_time'] = ''
+    st['bars_held'] = 0
+    st['high_since_entry'] = 0.0
+    st['entry_atr'] = 0.0
+    st['buy_count'] = 0
+
+
 def _already_signaled(C, stock, time_str, side):
     key = (stock, time_str, side)
     if key in C.signal_seen:
@@ -632,7 +643,6 @@ def _ensure_pos_state(C, stock):
             'buy_time': '',
             'bars_held': 0,
             'high_since_entry': 0.0,
-            'half_sold': False,
             'entry_atr': 0.0,
             'buy_count': 0,
         }
@@ -785,8 +795,8 @@ def init(C):
         POST_MARKET_NOTIFY_START, 'POST_MARKET_NOTIFY_START'
     )
     C.auto_execution_time = _validate_clock(AUTO_EXECUTION_TIME, 'AUTO_EXECUTION_TIME')
-    if C.auto_execution_time == C.post_market_notify_start:
-        raise ValueError("AUTO_EXECUTION_TIME 不能与 POST_MARKET_NOTIFY_START 相同")
+    if C.auto_execution_time >= C.post_market_notify_start:
+        raise ValueError("AUTO_EXECUTION_TIME 必须早于 POST_MARKET_NOTIFY_START")
     C.pending_order_file_path = PENDING_ORDER_FILE_PATH
     C.pending_orders = _load_pending_orders(C)
     C.submit_orders          = C.trade_mode == 'backtest'
@@ -897,20 +907,60 @@ def init(C):
     print("=" * 60)
 
 
+def _callback_value(info, *names, default=None):
+    if isinstance(info, dict):
+        for name in names:
+            if name in info:
+                return info[name]
+    else:
+        for name in names:
+            value = getattr(info, name, None)
+            if value is not None:
+                return value
+    return default
+
+
+def order_callback(C, order_info):
+    """记录原生 QMT 委托回报；拒单须立即通知人工处理。"""
+    status = _callback_value(order_info, 'order_status', 'status')
+    stock = _callback_value(order_info, 'stock_code', 'stock', default='未知标的')
+    order_id = _callback_value(order_info, 'order_id', 'entrust_no', default='未知编号')
+    message = _callback_value(order_info, 'status_msg', 'status_message', 'msg', default='')
+    _log(C, LOG_INFO, 'ORDER',
+         f"委托回报 stock={stock} order_id={order_id} status={status} {message}")
+    if str(status) == '57':
+        _log_error(C, f"{stock} 委托被拒绝/junk order_id={order_id}: {message}")
+        _send_wechat_notification(
+            C,
+            f'【@all 委托拒绝】{stock}',
+            f'@all\norder_id={order_id}\n状态=57（拒绝/junk）\n原因={message}',
+        )
+
+
+def deal_callback(C, deal_info):
+    """记录原生 QMT 成交回报，仓位在下一次决策时以券商实际数据同步。"""
+    stock = _callback_value(deal_info, 'stock_code', 'stock', default='未知标的')
+    volume = _callback_value(deal_info, 'volume', 'trade_volume', 'business_volume', default=0)
+    price = _callback_value(deal_info, 'price', 'trade_price', 'business_price', default=0)
+    direction = _callback_value(deal_info, 'order_type', 'direction', default='未知方向')
+    _log(C, LOG_INFO, 'ORDER',
+         f"成交回报 stock={stock} direction={direction} volume={volume} price={price}")
+
+
 # ---------------------------------------------------------------------------
 # 主逻辑
 # ---------------------------------------------------------------------------
 
 def handlebar(C):
-    if C.trade_mode != 'backtest' and not C.is_last_bar():
-        return
-    
-    C._bar_callback_count = getattr(C, '_bar_callback_count', 0) + 1
     now = datetime.now()
-    notify_period = _status_notification_period(now)
-
     if C.trade_mode == 'auto':
         _submit_due_pending_orders(C, now)
+
+    if C.trade_mode != 'backtest' and not C.is_last_bar():
+        return
+
+    C._bar_callback_count = getattr(C, '_bar_callback_count', 0) + 1
+    notify_period = _status_notification_period(now)
 
     if C.trade_mode in ('notify', 'auto') and not notify_period:
         return
@@ -1060,28 +1110,23 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
 
     st = _ensure_pos_state(C, stock)
     try:
-        broker_pos = C.get_position(stock) if hasattr(C, 'get_position') else 0
-    except Exception:
-        broker_pos = 0
-    if C.trade_mode == 'notify' and st['vol'] > 0 and broker_pos <= 0:
-        st['vol'] = 0
-        st['buy_price'] = 0.0
-        st['half_sold'] = False
-        st['bars_held'] = 0
-        st['high_since_entry'] = 0.0
-        st['buy_count'] = 0
-        _log(C, LOG_INFO, 'POS', f"{stock} 人工平仓已从券商持仓同步")
+        broker_pos = _get_broker_position_volume(C, stock)
+    except Exception as error:
+        _log_error(C, f"{stock} 查询券商持仓失败，跳过本次决策: {error}")
+        return
+    if st['vol'] > 0 and broker_pos <= 0:
+        _reset_position_state(st)
+        _log(C, LOG_INFO, 'POS', f"{stock} 已从券商持仓同步为无持仓")
     elif st['vol'] <= 0 and broker_pos > 0:
         st['vol'] = int(broker_pos)
         st['buy_price'] = curr_close
         st['buy_time'] = time_str + '(RECOVER)'
         st['high_since_entry'] = curr_close
-        st['half_sold'] = False
         st['buy_count'] = 1
         _log(C, LOG_WARN, 'POS', f"{stock} 从券商恢复持仓 vol={st['vol']}")
-    elif C.trade_mode == 'notify' and broker_pos > 0 and st['vol'] != broker_pos:
+    elif broker_pos > 0 and st['vol'] != broker_pos:
         st['vol'] = int(broker_pos)
-        _log(C, LOG_INFO, 'POS', f"{stock} 人工持仓已从券商同步 vol={st['vol']}")
+        _log(C, LOG_INFO, 'POS', f"{stock} 已从券商持仓同步 vol={st['vol']}")
 
     has_pos = st['vol'] > 0
 
@@ -1162,7 +1207,7 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
                 sell_reason = "MACD顶背离"
                 sell_ratio = 1.0
 
-        if sell_reason is None and not st.get('half_sold', False):
+        if sell_reason is None:
             death = (prev_dif is not None and prev_dea is not None and
                      prev_dif > prev_dea and curr_dif < curr_dea)
             if death:
@@ -1254,13 +1299,9 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
             if st['vol'] <= 0:
                 st['vol'] = 0
                 st['buy_price'] = 0.0
-                st['half_sold'] = False
                 st['bars_held'] = 0
                 st['high_since_entry'] = 0.0
                 st['buy_count'] = 0
-            else:
-                if '死叉' in sell_reason:
-                    st['half_sold'] = True
             _inc(C, 'signal_sell')
             return
     else:
@@ -1367,7 +1408,6 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
                 st['buy_time'] = time_str
                 st['bars_held'] = 0
                 st['high_since_entry'] = curr_close
-                st['half_sold'] = False
                 st['entry_atr'] = curr_atr if curr_atr else 0.0
             st['buy_count'] = st.get('buy_count', 0) + 1
             _inc(C, 'signal_buy')
