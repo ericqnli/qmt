@@ -997,8 +997,9 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
 
         # 4. MACD 顶背离
         if sell_reason is None:
-            if _detect_macd_top_divergence(close[:idx+1] if idx == -1 else close[:n+idx+1],
-                                           dif[:idx+1] if idx == -1 else dif[:n+idx+1],
+            div_end = None if idx == -1 else n + idx + 1
+            if _detect_macd_top_divergence(close[:div_end],
+                                           dif[:div_end],
                                            lookback=C.div_lookback,
                                            peak_order=C.div_peak_order):
                 sell_reason = "MACD顶背离"
