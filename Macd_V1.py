@@ -1153,8 +1153,8 @@ def _process_one(C, stock, time_str, idx, idx_prev, status_messages):
         f"KDJ金叉={'是' if kdj_golden else '否'}、超卖={'是' if kdj_oversold else '否'}；"
         f"RSI超卖回升={'是' if rsi_ok else '否'}；"
         f"{'放量过滤=关闭' if not C.use_volume_filter else f'放量={vol_flag}'}；"
+        f"可买入仓位={'是' if can_buy else '否'}"
         f"策略触发={trigger_by if entry_trigger else '否'}；"
-        f"可买入={'是' if can_buy else '否'}"
     )
     status_messages.append(f"{stock} {detail_payload}")
 
